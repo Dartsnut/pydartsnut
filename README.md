@@ -17,6 +17,22 @@ from pydartsnut import Dartsnut
 dartsnut = Dartsnut()
 ```
 
+### Retrieve user input parameters
+
+```python
+params = dartsnut.widget_params
+# Returns a dictionary of current widget parameters.
+print(params)
+
+# Safely get the city name from params
+city_name = ""
+if params is not None:
+	city_name = params.get("city", "")
+if city_name == "":
+	# TODO: assign default value or show a warning image
+    pass
+```
+
 ### Update the frame buffer for display
 
 ```python
