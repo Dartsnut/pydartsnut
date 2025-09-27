@@ -4,11 +4,18 @@ import sys
 import json
 import math
 import time
+import signal
 
 class Dartsnut:
     def __init__(self):
+        # Register the signal handler for SIGINT
+        signal.signal(signal.SIGINT, self.sigint_handler)
+        
         # prevent the shared memory from being tracked by resource_tracker
         self.remove_shm_from_resource_tracker()
+
+        # running state
+        self.running = True
 
         # parse the arguments
         parser = argparse.ArgumentParser(description="Dartsnut")
@@ -67,6 +74,10 @@ class Dartsnut:
 
         if "shared_memory" in resource_tracker._CLEANUP_FUNCS:
             del resource_tracker._CLEANUP_FUNCS["shared_memory"]
+
+    def sigint_handler(self, signum, frame):
+        """This function will be called when a SIGINT signal is received."""
+        self.running = False
 
     def update_frame_buffer(self, frame):
         """Update the shared memory buffer with the given image or buffer."""
