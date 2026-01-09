@@ -5,6 +5,7 @@ import json
 import math
 import time
 import signal
+import os
 
 class Dartsnut:
     def __init__(self):
@@ -31,6 +32,12 @@ class Dartsnut:
             default="pdishm",
             help="Shared memory name"
         )
+        parser.add_argument(
+            "--data-store",
+            type=str,
+            default=None,
+            help="Path to data store directory (defaults to script directory)"
+        )
         args = parser.parse_args()
         # load the parameters
         try:
@@ -53,6 +60,27 @@ class Dartsnut:
             sys.exit(1)
         self.shm_buffer = self.shm.buf
         self.shm_pdo_buf = self.shm_pdo.buf
+        
+        # Initialize data store
+        if args.data_store:
+            self.data_store_path = args.data_store
+        else:
+            # Default to script directory
+            try:
+                script_dir = os.path.dirname(os.path.abspath(__file__))
+                self.data_store_path = script_dir
+            except NameError:
+                # __file__ not available, fallback to current directory
+                self.data_store_path = os.getcwd()
+        
+        # Create data store directory if it doesn't exist
+        try:
+            os.makedirs(self.data_store_path, exist_ok=True)
+        except OSError as e:
+            print(f"Warning: Could not create data store directory '{self.data_store_path}': {e}")
+        
+        # Set JSON file path
+        self.data_store_file = os.path.join(self.data_store_path, "data.json")
 
     def remove_shm_from_resource_tracker(self):
         """Monkey-patch multiprocessing.resource_tracker so SharedMemory won't be tracked
@@ -152,3 +180,61 @@ class Dartsnut:
     def set_brightness(self, brightness):
         if (10 <= brightness <= 100):
             self.shm_pdo_buf[49] = brightness
+
+    def set_value(self, key, value):
+        """Set a key-value pair in the data store.
+        
+        Args:
+            key (str): The key to store the value under
+            value: Any JSON-serializable value
+        """
+        # Load existing data
+        data = {}
+        if os.path.exists(self.data_store_file):
+            try:
+                with open(self.data_store_file, 'r') as f:
+                    data = json.load(f)
+            except (json.JSONDecodeError, IOError) as e:
+                # If file is corrupted, start with empty dict
+                print(f"Warning: Could not read data store file: {e}")
+                data = {}
+        
+        # Update the key-value pair
+        data[key] = value
+        
+        # Write atomically (write to temp file, then rename)
+        temp_file = self.data_store_file + '.tmp'
+        try:
+            with open(temp_file, 'w') as f:
+                json.dump(data, f, indent=2)
+            # Atomic rename
+            os.replace(temp_file, self.data_store_file)
+        except (IOError, OSError) as e:
+            # Clean up temp file if it exists
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except OSError:
+                    pass
+            raise IOError(f"Could not write to data store file: {e}")
+
+    def get_value(self, key, default=None):
+        """Get a value from the data store.
+        
+        Args:
+            key (str): The key to retrieve
+            default: The default value to return if key doesn't exist (default: None)
+            
+        Returns:
+            The value associated with the key, or default if key doesn't exist
+        """
+        if not os.path.exists(self.data_store_file):
+            return default
+        
+        try:
+            with open(self.data_store_file, 'r') as f:
+                data = json.load(f)
+            return data.get(key, default)
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"Warning: Could not read data store file: {e}")
+            return default
