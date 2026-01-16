@@ -1,7 +1,7 @@
 # pyproject.toml
     [project]
     name = "pydartsnut"
-    version = "0.1.1"
+    version = "1.0.0"
     description = "dartsnut python package"
     readme = "README.md"
     requires-python = ">=3.1"
@@ -13,6 +13,12 @@
     [build-system]
     requires = ["setuptools>=61.0"]
     build-backend = "setuptools.build_meta"
+
+    [tool.setuptools]
+    packages = ["pydartsnut"]
+    
+    [tool.setuptools.package-dir]
+    "pydartsnut" = "."
 
     [project.urls]
     "Homepage" = "https://github.com/Dartsnut/pydartsnut"
