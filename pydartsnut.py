@@ -1,3 +1,11 @@
+"""Main module for Dartsnut hardware interface.
+
+This module provides the Dartsnut class for interfacing with Dartsnut hardware,
+including shared memory communication, dart position tracking, button state
+monitoring, and data persistence.
+"""
+from __future__ import annotations
+
 from multiprocessing import shared_memory, resource_tracker
 import argparse
 import sys
@@ -6,9 +14,32 @@ import math
 import time
 import signal
 import os
+from typing import List, Dict, Any, Optional, Union
+from .input_handler import InputHandler, DartHit, ButtonStates, DartStates
 
 class Dartsnut:
-    def __init__(self):
+    """Main interface for Dartsnut hardware.
+    
+    This class provides methods to interact with Dartsnut hardware including:
+    - Reading dart positions from the board
+    - Reading button states
+    - Updating the display frame buffer
+    - Managing persistent data storage
+    - Event-based input handling via InputHandler
+    
+    Attributes:
+        running: Boolean flag indicating if the application should continue running.
+        widget_params: Dictionary of widget parameters parsed from command line.
+        shm: Shared memory object for display communication.
+        shm_pdo: Shared memory object for input data.
+        shm_buffer: Buffer view of display shared memory.
+        shm_pdo_buf: Buffer view of input shared memory.
+        data_store_path: Path to the directory for data storage.
+        data_store_file: Path to the JSON file for data storage.
+        input_handler: InputHandler instance for event-based input handling.
+    """
+    
+    def __init__(self) -> None:
         # Register the signal handler for SIGINT
         signal.signal(signal.SIGINT, self.sigint_handler)
         
@@ -81,10 +112,16 @@ class Dartsnut:
         
         # Set JSON file path
         self.data_store_file = os.path.join(self.data_store_path, "data.json")
+        
+        # Initialize input handler
+        self.input_handler = InputHandler(self)
 
-    def remove_shm_from_resource_tracker(self):
-        """Monkey-patch multiprocessing.resource_tracker so SharedMemory won't be tracked
-
+    def remove_shm_from_resource_tracker(self) -> None:
+        """Monkey-patch multiprocessing.resource_tracker so SharedMemory won't be tracked.
+        
+        This is a workaround for a Python bug where SharedMemory objects are
+        incorrectly tracked by the resource tracker, causing cleanup issues.
+        
         More details at: https://bugs.python.org/issue38119
         """
 
@@ -103,12 +140,36 @@ class Dartsnut:
         if "shared_memory" in resource_tracker._CLEANUP_FUNCS:
             del resource_tracker._CLEANUP_FUNCS["shared_memory"]
 
-    def sigint_handler(self, signum, frame):
-        """This function will be called when a SIGINT signal is received."""
+    def sigint_handler(self, signum: int, frame: Any) -> None:
+        """Handle SIGINT signal (Ctrl+C).
+        
+        This function will be called when a SIGINT signal is received.
+        Sets the running flag to False to allow graceful shutdown.
+        
+        Args:
+            signum: Signal number (unused).
+            frame: Current stack frame (unused).
+        """
         self.running = False
 
-    def update_frame_buffer(self, frame):
-        """Update the shared memory buffer with the given image or buffer."""
+    def update_frame_buffer(self, frame: Union[bytearray, Any]) -> bool:
+        """Update the shared memory buffer with the given image or buffer.
+        
+        The frame can be either a bytearray or any object with a tobytes() method
+        (such as PIL Image objects). The buffer must be in RGB888 format.
+        
+        Args:
+            frame: Image data as bytearray or object with tobytes() method.
+                Must be in RGB888 format.
+        
+        Returns:
+            True if the frame buffer was successfully updated, False otherwise.
+            Returns False if the display buffer is busy (status == 2) or in
+            an invalid state.
+        
+        Raises:
+            TypeError: If frame is not a bytearray and doesn't have a tobytes() method.
+        """
         if isinstance(frame, bytearray):
             image_bytes = frame
         elif hasattr(frame, 'tobytes'):
@@ -125,8 +186,20 @@ class Dartsnut:
         else:
             return False
 
-    def get_darts(self):
-        darts = []
+    def get_darts(self) -> DartStates:
+        """Get current dart positions from the hardware.
+        
+        Reads raw dart positions from shared memory and maps them to the
+        display coordinate system (0-127 for both x and y). Invalid positions
+        are represented as [-1, -1].
+        
+        Returns:
+            List of 12 dart positions. Each position is a list [x, y] where:
+                - x, y: Coordinates in range 0-127, or -1 if dart not present
+                - Positions are mapped from hardware coordinates (1800-39800)
+                  to display coordinates (0-127)
+        """
+        darts: DartStates = []
         buf = self.shm_pdo_buf
         for i in range(12):
             x = buf[i*4+1] + (buf[i*4+2] << 8)
@@ -150,8 +223,25 @@ class Dartsnut:
                 darts.append([-1, -1])
         return darts
 
-    def get_buttons(self):
-        buttons = {
+    def get_buttons(self) -> ButtonStates:
+        """Get current button states from the hardware.
+        
+        Reads button states from shared memory with debouncing (30ms delay).
+        This method returns the current state of all buttons, not just events.
+        For event-based button detection (only True on press), use get_button_events().
+        
+        Returns:
+            Dictionary mapping button names to their current pressed state:
+                - "btn_a": Button A state
+                - "btn_b": Button B state
+                - "btn_up": Up button state
+                - "btn_right": Right button state
+                - "btn_left": Left button state
+                - "btn_down": Down button state
+                - "btn_home": Home button state
+                - "btn_reserved": Reserved button state
+        """
+        buttons: ButtonStates = {
             "btn_a": bool(self.shm_pdo_buf[0] & 1),
             "btn_b": bool(self.shm_pdo_buf[0] & 2),
             "btn_up": bool(self.shm_pdo_buf[0] & 4),
@@ -177,16 +267,29 @@ class Dartsnut:
             buttons[k] = self._button_states[k]
         return buttons
 
-    def set_brightness(self, brightness):
+    def set_brightness(self, brightness: int) -> None:
+        """Set the display brightness.
+        
+        Args:
+            brightness: Brightness level between 10 and 100 (inclusive).
+                Values outside this range are ignored.
+        """
         if (10 <= brightness <= 100):
             self.shm_pdo_buf[49] = brightness
 
-    def set_value(self, key, value):
+    def set_value(self, key: str, value: Any) -> None:
         """Set a key-value pair in the data store.
         
+        The value is stored in a JSON file atomically (using a temporary file
+        and rename operation) to prevent corruption during writes.
+        
         Args:
-            key (str): The key to store the value under
-            value: Any JSON-serializable value
+            key: The key to store the value under.
+            Must be a valid JSON key (string).
+            value: Any JSON-serializable value (dict, list, str, int, float, bool, None).
+        
+        Raises:
+            IOError: If the data store file cannot be written.
         """
         # Load existing data
         data = {}
@@ -218,15 +321,17 @@ class Dartsnut:
                     pass
             raise IOError(f"Could not write to data store file: {e}")
 
-    def get_value(self, key, default=None):
+    def get_value(self, key: str, default: Optional[Any] = None) -> Any:
         """Get a value from the data store.
         
         Args:
-            key (str): The key to retrieve
-            default: The default value to return if key doesn't exist (default: None)
-            
+            key: The key to retrieve.
+            default: The default value to return if key doesn't exist.
+                Defaults to None.
+        
         Returns:
             The value associated with the key, or default if key doesn't exist
+            or if the data store file cannot be read.
         """
         if not os.path.exists(self.data_store_file):
             return default
@@ -238,3 +343,62 @@ class Dartsnut:
         except (json.JSONDecodeError, IOError) as e:
             print(f"Warning: Could not read data store file: {e}")
             return default
+
+    def get_dart_hits(self) -> List[DartHit]:
+        """Get dart hits from the hardware - event-based detection.
+        
+        This method only registers dart hits when a dart transitions from an
+        invalid state ([-1, -1] or [0, 0]) to a valid position [x, y]. Once a
+        dart hit is detected, that dart index is blocked to prevent duplicate
+        events. The dart will be unblocked after 0.5 seconds of receiving invalid state.
+        
+        Returns:
+            List of tuples (dart_index, x, y) for new dart hits detected
+            since the last call. Each tuple contains:
+                - dart_index: Integer from 0-11 identifying the dart
+                - x: X coordinate (0-127)
+                - y: Y coordinate (0-127)
+        """
+        return self.input_handler.get_dart_hits()
+
+    def get_active_darts(self) -> List[DartHit]:
+        """Get all currently active darts on the board.
+        
+        This method reports ALL active darts regardless of blocking state.
+        Blocking only affects get_dart_hits(), not get_active_darts().
+        This is useful for registration and continuous tracking where you need
+        to see all darts on the board. The blocking timers are still updated
+        to allow unblocking of previously blocked darts.
+        
+        Returns:
+            List of tuples (dart_index, x, y) for all active darts currently
+            on the board. Each tuple contains:
+                - dart_index: Integer from 0-11 identifying the dart
+                - x: X coordinate (0-127)
+                - y: Y coordinate (0-127)
+        """
+        return self.input_handler.get_active_darts()
+
+    def reset_blocking_state(self) -> None:
+        """Reset the dart index blocking state.
+        
+        Clears all blocked dart indices and idle timers. This allows all
+        dart indices to be eligible for event detection again.
+        """
+        self.input_handler.reset_blocking_state()
+
+    def get_button_events(self) -> ButtonStates:
+        """Get button states from the hardware - event-based detection.
+        
+        This method returns button states that are True only when a button
+        transitions from not pressed to pressed. This provides event-based
+        button detection rather than continuous state polling.
+        
+        Returns:
+            Dictionary mapping button names to boolean values. Only buttons
+            that have just been pressed (transitioned from False to True)
+            will have True values. All other buttons will be False.
+            Button names: "btn_a", "btn_b", "btn_up", "btn_right", "btn_left",
+            "btn_down", "btn_home", "btn_reserved".
+        """
+        return self.input_handler.get_buttons()
