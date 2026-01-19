@@ -15,7 +15,7 @@ import time
 import signal
 import os
 from typing import List, Dict, Any, Optional, Union
-from .input_handler import InputHandler, DartHit, ButtonStates, DartStates
+from ._input_handler import InputHandler, DartHit, ButtonStates, DartStates
 
 class Dartsnut:
     """Main interface for Dartsnut hardware.
