@@ -74,6 +74,7 @@ class InputHandler:
     """
 
     IDLE_UNBLOCK_DURATION: float = 0.5  # 500 milliseconds in real time
+    MIN_ACTIVE_DURATION: float = 0.11  # Minimum time in seconds a coordinate must be valid to be reported
 
     def __init__(self, engine: EngineProtocol) -> None:
         """Initialize the InputHandler.
@@ -85,10 +86,12 @@ class InputHandler:
         self.engine: EngineProtocol = engine
         self.last_buttons: ButtonStates = {}
         self.last_darts: DartStates = []
-        
+
         # Dart index blocking system
         self.blocked_dart_indices: Set[int] = set()  # Track currently blocked dart indices
         self.dart_idle_start_times: Dict[int, float] = {}  # Track when each dart_index started receiving invalid state (timestamp)
+        # Coordinate-based active timing: when each (x, y) first became valid.
+        self.coord_active_start_times: Dict[Tuple[int, int], float] = {}
 
     def _update_blocking_timers(self, dart_states: DartStates) -> None:
         """Update blocking timers based on current dart states.
@@ -140,8 +143,8 @@ class InputHandler:
     def get_dart_hits(self) -> List[DartHit]:
         """Get dart hits from the hardware - event-based detection.
         
-        This method only registers dart hits when a dart transitions from an
-        invalid state ([-1, -1] or [0, 0]) to a valid position [x, y]. Once a
+        A dart hit is only registered when its coordinate (x, y) has been
+        continuously valid for at least MIN_ACTIVE_DURATION seconds. Once a
         dart hit is detected, that dart index is blocked to prevent duplicate
         events. The dart will be unblocked after IDLE_UNBLOCK_DURATION seconds
         of receiving invalid state.
@@ -154,39 +157,57 @@ class InputHandler:
                 - y: Y coordinate (0-127)
         """
         raw_darts = self.engine.get_darts()
-        dart_hits = []
+        dart_hits: List[DartHit] = []
+        now = time.time()
 
         if self.last_darts == []:
             self.last_darts = raw_darts
             return dart_hits
 
         if isinstance(raw_darts, (list, tuple)) and len(raw_darts) == 12:
+            # Build set of currently valid coordinates.
+            current_valid_coords = set()
+            for dart in raw_darts:
+                if isinstance(dart, (list, tuple)) and len(dart) >= 2:
+                    if not _is_invalid_dart(dart):
+                        current_valid_coords.add((dart[0], dart[1]))
+
+            # Initialize timers for newly lit coordinates.
+            for coord in current_valid_coords:
+                if coord not in self.coord_active_start_times:
+                    self.coord_active_start_times[coord] = now
+
+            # Remove timers for coordinates that are no longer lit.
+            for coord in list(self.coord_active_start_times.keys()):
+                if coord not in current_valid_coords:
+                    del self.coord_active_start_times[coord]
+
+            # Decide which darts should emit hits based on coordinate durations.
             for index, dart in enumerate(raw_darts):
                 if isinstance(dart, (list, tuple)) and len(dart) >= 2:
-                    # Event-based debounce: only register hit when transitioning from [-1, -1] to [x, y]
-                    last_dart = self.last_darts[index] if index < len(self.last_darts) else [-1, -1]
-                    last_invalid = _is_invalid_dart(last_dart)
-                    curr_invalid = _is_invalid_dart(dart)
-                    
-                    if last_invalid and not curr_invalid:
-                        # Check if this dart_index is blocked
-                        if index not in self.blocked_dart_indices:
+                    if not _is_invalid_dart(dart):
+                        coord = (dart[0], dart[1])
+                        start = self.coord_active_start_times.get(coord)
+                        if start is None:
+                            continue
+                        elapsed = now - start
+                        if elapsed >= self.MIN_ACTIVE_DURATION and index not in self.blocked_dart_indices:
                             timestamp = time.strftime("%H:%M:%S", time.localtime())
-                            print(f"[{timestamp}] Dart {index} BLOCKED (event fired at [{dart[0]}, {dart[1]}])")
+                            print(
+                                f"[{timestamp}] Dart {index} BLOCKED (event fired at [{dart[0]}, {dart[1]}]) "
+                                f"after {elapsed:.3f}s active at coordinate {coord}"
+                            )
                             dart_hits.append((index, dart[0], dart[1]))
                             # Block this dart_index immediately after detecting the event
                             self.blocked_dart_indices.add(index)
                             # Clear any existing idle timer since we just blocked it
                             if index in self.dart_idle_start_times:
                                 del self.dart_idle_start_times[index]
-                        else:
-                            timestamp = time.strftime("%H:%M:%S", time.localtime())
-                            print(f"[{timestamp}] Dart {index} transition detected but was already BLOCKED (skipped)")
 
             # Update blocking timers based on current dart states (after processing events)
             self._update_blocking_timers(raw_darts)
 
-            # Update last darts
+            # Update last darts (still maintained for compatibility, though not used for timing)
             self.last_darts = [
                 (
                     list(p[:2])
@@ -201,10 +222,11 @@ class InputHandler:
     def get_active_darts(self) -> List[DartHit]:
         """Get all currently active darts on the board.
         
-        This method reports ALL active darts regardless of blocking state.
-        Blocking only affects get_dart_hits(), not get_active_darts().
+        This method reports active darts whose coordinates have been continuously
+        valid for at least MIN_ACTIVE_DURATION seconds, regardless of blocking
+        state. Blocking only affects get_dart_hits(), not get_active_darts().
         This is useful for registration and continuous tracking where you need
-        to see all darts on the board. The blocking timers are still updated
+        to see stable darts on the board. The blocking timers are still updated
         to allow unblocking of previously blocked darts.
 
         Returns:
@@ -214,7 +236,7 @@ class InputHandler:
                 - x: X coordinate (0-127)
                 - y: Y coordinate (0-127)
         """
-        active_darts = []
+        active_darts: List[DartHit] = []
         current_darts = self.engine.get_darts()
 
         # Update blocking timers based on current dart states (for unblocking)
@@ -222,12 +244,37 @@ class InputHandler:
             self._update_blocking_timers(current_darts)
 
         if isinstance(current_darts, (list, tuple)) and len(current_darts) == 12:
+            now = time.time()
+
+            # Build set of currently valid coordinates.
+            current_valid_coords = set()
+            for curr_dart in current_darts:
+                if isinstance(curr_dart, (list, tuple)) and len(curr_dart) >= 2:
+                    if not _is_invalid_dart(curr_dart):
+                        current_valid_coords.add((curr_dart[0], curr_dart[1]))
+
+            # Initialize timers for newly lit coordinates.
+            for coord in current_valid_coords:
+                if coord not in self.coord_active_start_times:
+                    self.coord_active_start_times[coord] = now
+
+            # Remove timers for coordinates that are no longer lit.
+            for coord in list(self.coord_active_start_times.keys()):
+                if coord not in current_valid_coords:
+                    del self.coord_active_start_times[coord]
+
+            # Only report darts whose coordinates have been active long enough.
             for i in range(12):
                 curr_dart = current_darts[i]
                 if isinstance(curr_dart, (list, tuple)) and len(curr_dart) >= 2:
                     if not _is_invalid_dart(curr_dart):
-                        # Report ALL active darts, regardless of blocking state
-                        active_darts.append((i, curr_dart[0], curr_dart[1]))
+                        coord = (curr_dart[0], curr_dart[1])
+                        start = self.coord_active_start_times.get(coord)
+                        if start is None:
+                            continue
+                        elapsed = now - start
+                        if elapsed >= self.MIN_ACTIVE_DURATION:
+                            active_darts.append((i, curr_dart[0], curr_dart[1]))
 
         return active_darts
 
@@ -257,8 +304,10 @@ class InputHandler:
     def reset_blocking_state(self) -> None:
         """Reset the dart index blocking state.
         
-        Clears all blocked dart indices and idle timers. This allows all
-        dart indices to be eligible for event detection again.
+        Clears all blocked dart indices, coordinate timers, and idle timers.
+        This allows all dart indices and coordinates to be eligible for
+        event detection again.
         """
         self.blocked_dart_indices.clear()
         self.dart_idle_start_times.clear()
+        self.coord_active_start_times.clear()
