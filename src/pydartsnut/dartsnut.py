@@ -14,8 +14,18 @@ import math
 import time
 import signal
 import os
+import ctypes
+import ctypes.util
 from typing import List, Dict, Any, Optional, Union
 from ._input_handler import InputHandler, DartHit, ButtonStates, DartStates
+
+_libc_path = ctypes.util.find_library("c")
+_libc = ctypes.CDLL(_libc_path, use_errno=True) if _libc_path else None
+SEM_FAILED = ctypes.c_void_p(-1).value
+if _libc is not None:
+    _libc.sem_open.restype = ctypes.c_void_p
+    _libc.sem_post.argtypes = [ctypes.c_void_p]
+    _libc.sem_close.argtypes = [ctypes.c_void_p]
 
 class Dartsnut:
     """Main interface for Dartsnut hardware.
@@ -91,6 +101,8 @@ class Dartsnut:
             sys.exit(1)
         self.shm_buffer = self.shm.buf
         self.shm_pdo_buf = self.shm_pdo.buf
+        self._render_sem: Optional[ctypes.c_void_p] = None
+        self._open_render_semaphore()
         
         # Initialize data store
         if args.data_store:
@@ -115,6 +127,27 @@ class Dartsnut:
         
         # Initialize input handler
         self.input_handler = InputHandler(self)
+
+    def _open_render_semaphore(self) -> None:
+        """Open or create shared render semaphore for low-latency wakeups."""
+        if _libc is None:
+            return
+        try:
+            # sem_open(name, oflag, mode, value) - use O_CREAT to tolerate startup ordering.
+            handle = _libc.sem_open(b"/pdishm_render_ready", os.O_CREAT, 0o666, 0)
+            if handle and handle != SEM_FAILED:
+                self._render_sem = ctypes.c_void_p(handle)
+        except Exception:
+            self._render_sem = None
+
+    def _post_render_semaphore(self) -> None:
+        """Signal matrix renderer that a fresh frame is ready."""
+        if _libc is None or self._render_sem is None:
+            return
+        try:
+            _libc.sem_post(self._render_sem)
+        except Exception:
+            pass
 
     def remove_shm_from_resource_tracker(self) -> None:
         """Monkey-patch multiprocessing.resource_tracker so SharedMemory won't be tracked.
@@ -182,9 +215,23 @@ class Dartsnut:
         elif (self.shm_buffer[0] == 1):
             self.shm_buffer[1:len(image_bytes)+1] = image_bytes
             self.shm_buffer[0] = 0
+            self._post_render_semaphore()
             return True
         else:
             return False
+
+    def close(self) -> None:
+        """Release native resources held by this instance."""
+        if _libc is None or self._render_sem is None:
+            return
+        try:
+            _libc.sem_close(self._render_sem)
+        except Exception:
+            pass
+        self._render_sem = None
+
+    def __del__(self) -> None:
+        self.close()
 
     def get_darts(self) -> DartStates:
         """Get current dart positions from the hardware.
