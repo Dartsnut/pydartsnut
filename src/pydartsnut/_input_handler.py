@@ -6,7 +6,7 @@ mechanisms for dart hits and button presses.
 from __future__ import annotations
 
 import time
-from typing import List, Tuple, Dict, Set, Any, Union
+from typing import List, Tuple, Dict, Set, Any, Union, Optional
 
 try:
     from typing import Protocol
@@ -73,10 +73,15 @@ class InputHandler:
             when they started receiving invalid state.
     """
 
-    IDLE_UNBLOCK_DURATION: float = 0.5  # 500 milliseconds in real time
-    MIN_ACTIVE_DURATION: float = 0.11  # Minimum time in seconds a coordinate must be valid to be reported
+    IDLE_UNBLOCK_DURATION: float = 0.2  # Default seconds of invalid state before unblocking
+    MIN_ACTIVE_DURATION: float = 0.0  # Default: no coordinate active-time safeguard
 
-    def __init__(self, engine: EngineProtocol) -> None:
+    def __init__(
+        self,
+        engine: EngineProtocol,
+        min_active_duration: Optional[float] = None,
+        idle_unblock_duration: Optional[float] = None,
+    ) -> None:
         """Initialize the InputHandler.
         
         Args:
@@ -84,6 +89,12 @@ class InputHandler:
                 get_darts() and get_buttons() methods.
         """
         self.engine: EngineProtocol = engine
+        self.MIN_ACTIVE_DURATION = (
+            0.0 if min_active_duration is None else max(0.0, float(min_active_duration))
+        )
+        self.IDLE_UNBLOCK_DURATION = (
+            0.2 if idle_unblock_duration is None else max(0.0, float(idle_unblock_duration))
+        )
         self.last_buttons: ButtonStates = {}
         self.last_darts: DartStates = []
 
@@ -123,6 +134,11 @@ class InputHandler:
             if dart_index in self.blocked_dart_indices:
                 # Dart is blocked - only handle timer updates and unblocking
                 if is_invalid:
+                    if self.IDLE_UNBLOCK_DURATION <= 0.0:
+                        self.blocked_dart_indices.remove(dart_index)
+                        if dart_index in self.dart_idle_start_times:
+                            del self.dart_idle_start_times[dart_index]
+                        continue
                     # Receiving [-1, -1] or [0, 0] - track start time if not already tracking
                     if dart_index not in self.dart_idle_start_times:
                         self.dart_idle_start_times[dart_index] = current_time
@@ -165,37 +181,43 @@ class InputHandler:
             return dart_hits
 
         if isinstance(raw_darts, (list, tuple)) and len(raw_darts) == 12:
-            # Build set of currently valid coordinates.
-            current_valid_coords = set()
-            for dart in raw_darts:
-                if isinstance(dart, (list, tuple)) and len(dart) >= 2:
-                    if not _is_invalid_dart(dart):
-                        current_valid_coords.add((dart[0], dart[1]))
+            use_active_guard = self.MIN_ACTIVE_DURATION > 0.0
+            if use_active_guard:
+                # Build set of currently valid coordinates.
+                current_valid_coords = set()
+                for dart in raw_darts:
+                    if isinstance(dart, (list, tuple)) and len(dart) >= 2:
+                        if not _is_invalid_dart(dart):
+                            current_valid_coords.add((dart[0], dart[1]))
 
-            # Initialize timers for newly lit coordinates.
-            for coord in current_valid_coords:
-                if coord not in self.coord_active_start_times:
-                    self.coord_active_start_times[coord] = now
+                # Initialize timers for newly lit coordinates.
+                for coord in current_valid_coords:
+                    if coord not in self.coord_active_start_times:
+                        self.coord_active_start_times[coord] = now
 
-            # Remove timers for coordinates that are no longer lit.
-            for coord in list(self.coord_active_start_times.keys()):
-                if coord not in current_valid_coords:
-                    del self.coord_active_start_times[coord]
+                # Remove timers for coordinates that are no longer lit.
+                for coord in list(self.coord_active_start_times.keys()):
+                    if coord not in current_valid_coords:
+                        del self.coord_active_start_times[coord]
+            elif self.coord_active_start_times:
+                self.coord_active_start_times.clear()
 
             # Decide which darts should emit hits based on coordinate durations.
             for index, dart in enumerate(raw_darts):
                 if isinstance(dart, (list, tuple)) and len(dart) >= 2:
                     if not _is_invalid_dart(dart):
-                        coord = (dart[0], dart[1])
-                        start = self.coord_active_start_times.get(coord)
-                        if start is None:
-                            continue
-                        elapsed = now - start
+                        elapsed = self.MIN_ACTIVE_DURATION
+                        if use_active_guard:
+                            coord = (dart[0], dart[1])
+                            start = self.coord_active_start_times.get(coord)
+                            if start is None:
+                                continue
+                            elapsed = now - start
                         if elapsed >= self.MIN_ACTIVE_DURATION and index not in self.blocked_dart_indices:
                             timestamp = time.strftime("%H:%M:%S", time.localtime())
                             print(
                                 f"[{timestamp}] Dart {index} BLOCKED (event fired at [{dart[0]}, {dart[1]}]) "
-                                f"after {elapsed:.3f}s active at coordinate {coord}"
+                                f"after {elapsed:.3f}s active at coordinate {(dart[0], dart[1])}"
                             )
                             dart_hits.append((index, dart[0], dart[1]))
                             # Block this dart_index immediately after detecting the event
@@ -245,34 +267,41 @@ class InputHandler:
 
         if isinstance(current_darts, (list, tuple)) and len(current_darts) == 12:
             now = time.time()
+            use_active_guard = self.MIN_ACTIVE_DURATION > 0.0
 
-            # Build set of currently valid coordinates.
-            current_valid_coords = set()
-            for curr_dart in current_darts:
-                if isinstance(curr_dart, (list, tuple)) and len(curr_dart) >= 2:
-                    if not _is_invalid_dart(curr_dart):
-                        current_valid_coords.add((curr_dart[0], curr_dart[1]))
+            if use_active_guard:
+                # Build set of currently valid coordinates.
+                current_valid_coords = set()
+                for curr_dart in current_darts:
+                    if isinstance(curr_dart, (list, tuple)) and len(curr_dart) >= 2:
+                        if not _is_invalid_dart(curr_dart):
+                            current_valid_coords.add((curr_dart[0], curr_dart[1]))
 
-            # Initialize timers for newly lit coordinates.
-            for coord in current_valid_coords:
-                if coord not in self.coord_active_start_times:
-                    self.coord_active_start_times[coord] = now
+                # Initialize timers for newly lit coordinates.
+                for coord in current_valid_coords:
+                    if coord not in self.coord_active_start_times:
+                        self.coord_active_start_times[coord] = now
 
-            # Remove timers for coordinates that are no longer lit.
-            for coord in list(self.coord_active_start_times.keys()):
-                if coord not in current_valid_coords:
-                    del self.coord_active_start_times[coord]
+                # Remove timers for coordinates that are no longer lit.
+                for coord in list(self.coord_active_start_times.keys()):
+                    if coord not in current_valid_coords:
+                        del self.coord_active_start_times[coord]
+            elif self.coord_active_start_times:
+                self.coord_active_start_times.clear()
 
             # Only report darts whose coordinates have been active long enough.
             for i in range(12):
                 curr_dart = current_darts[i]
                 if isinstance(curr_dart, (list, tuple)) and len(curr_dart) >= 2:
                     if not _is_invalid_dart(curr_dart):
-                        coord = (curr_dart[0], curr_dart[1])
-                        start = self.coord_active_start_times.get(coord)
-                        if start is None:
-                            continue
-                        elapsed = now - start
+                        if use_active_guard:
+                            coord = (curr_dart[0], curr_dart[1])
+                            start = self.coord_active_start_times.get(coord)
+                            if start is None:
+                                continue
+                            elapsed = now - start
+                        else:
+                            elapsed = self.MIN_ACTIVE_DURATION
                         if elapsed >= self.MIN_ACTIVE_DURATION:
                             active_darts.append((i, curr_dart[0], curr_dart[1]))
 

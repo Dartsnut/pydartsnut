@@ -79,6 +79,18 @@ class Dartsnut:
             default=None,
             help="Path to data store directory (defaults to script directory)"
         )
+        parser.add_argument(
+            "--min-active-duration",
+            type=float,
+            default=None,
+            help="Minimum coordinate active duration (seconds) before hit event"
+        )
+        parser.add_argument(
+            "--idle-unblock-duration",
+            type=float,
+            default=None,
+            help="Invalid-state duration (seconds) before blocked dart unblocks"
+        )
         args = parser.parse_args()
         # load the parameters
         try:
@@ -125,8 +137,12 @@ class Dartsnut:
         # Set JSON file path
         self.data_store_file = os.path.join(self.data_store_path, "data.json")
         
-        # Initialize input handler
-        self.input_handler = InputHandler(self)
+        # Initialize input handler with optional timing overrides from widget params.
+        self.input_handler = InputHandler(
+            self,
+            min_active_duration=args.min_active_duration,
+            idle_unblock_duration=args.idle_unblock_duration,
+        )
 
     def _open_render_semaphore(self) -> None:
         """Open or create shared render semaphore for low-latency wakeups."""
